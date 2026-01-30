@@ -23,8 +23,9 @@ class TrafficAnalyzer:
     def __init__(self, mode="auto"):
         self.lock = threading.Lock()
         self.data = []
+        # UPDATED LOCATION: 10°01'22.4"N 76°18'34.2"E -> 10.0229, 76.3095
         self.camera_config = [
-            {"id": "CAM_002", "lat": 10.025, "lng": 76.312, "name": "Seaport-Airport Rd", "file": "traffic_cam2.mp4"}
+            {"id": "CAM_002", "lat": 10.0229, "lng": 76.3095, "name": "Seaport-Airport Rd", "file": "traffic_cam2.mp4", "source_type": "live_cctv", "lanes": 8}
         ]
         self.unique_ids = set() # Store unique vehicle track IDs
         self.vehicle_types = ["car", "bike", "bus", "truck"]
@@ -42,15 +43,36 @@ class TrafficAnalyzer:
             
         logger.info(f"Traffic Analyzer starting in {self.mode.upper()} mode.")
 
-        # Initialize Dummy Nodes (Static Locations)
+        # Initialize Dummy Nodes (Simulated Data)
+        # Initialize Dummy Nodes (Simulated Data on Roads)
         self.dummy_nodes = []
-        base_lat, base_lng = 10.025, 76.312
-        for i in range(20):
+        
+        # Hardcoded coordinates to align with actual roads near 10.025, 76.312
+        # Roughly representing a North-South and East-West intersection pattern
+        # Try to fetch REAL road geometry from OpenStreetMap
+        # Try to fetch REAL road geometry from OpenStreetMap around the NEW location
+        road_points = self.fetch_road_geometry(10.0229, 76.3095)
+        
+        if not road_points:
+             # Fallback to Hardcoded coordinates if API fails
+            logger.warning("OSM Fetch failed, using fallback coordinates.")
+            road_points = [
+                # --- Seaport-Airport Road (Main Artery) ---
+                (10.0300, 76.3115), (10.0290, 76.3116), (10.0280, 76.3117),
+                (10.0270, 76.3118), (10.0260, 76.3119), (10.0250, 76.3120),
+                (10.0240, 76.3121), (10.0230, 76.3122), (10.0220, 76.3123),
+                (10.0210, 76.3124),
+                (10.0250, 76.3090), (10.0250, 76.3100), (10.0250, 76.3110),
+                (10.0252, 76.3130), (10.0253, 76.3140), (10.0255, 76.3150)
+            ]
+
+        for i, (r_lat, r_lng) in enumerate(road_points):
             self.dummy_nodes.append({
-                "lat": base_lat + random.uniform(-0.005, 0.005),
-                "lng": base_lng + random.uniform(-0.005, 0.005),
+                "lat": r_lat,
+                "lng": r_lng,
                 "id": f"DUMMY_{i}",
-                "name": f"Sensor Node #{i+1}"
+                "name": f"Sensor Node #{i+1}",
+                "source_type": "simulated_cctv"
             })
 
         # Initialize AI
@@ -65,6 +87,42 @@ class TrafficAnalyzer:
         self.thread = threading.Thread(target=self._run_pipeline)
         self.thread.daemon = True
         self.thread.start()
+    
+    def fetch_road_geometry(self, lat, lng, radius=200):
+        """
+        Fetches road coordinates from OpenStreetMap using Overpass API.
+        Returns a list of (lat, lng) tuples.
+        """
+        import requests
+        try:
+            # Query for driving roads (highway) around the point
+            overpass_url = "http://overpass-api.de/api/interpreter"
+            overpass_query = f"""
+                [out:json];
+                way["highway"](around:{radius},{lat},{lng});
+                (._;>;);
+                out body;
+            """
+            response = requests.get(overpass_url, params={'data': overpass_query}, timeout=5)
+            data = response.json()
+            
+            nodes = {n['id']: (n['lat'], n['lon']) for n in data['elements'] if n['type'] == 'node'}
+            ways = [x for x in data['elements'] if x['type'] == 'way']
+            
+            points = []
+            for way in ways:
+                # Get all nodes in the way
+                way_nodes = way['nodes']
+                # Sample every Nth node to avoid too many dots
+                for nid in way_nodes[::2]: 
+                    if nid in nodes:
+                        points.append(nodes[nid])
+            
+            logger.info(f"Fetched {len(points)} road points from OSM.")
+            return points
+        except Exception as e:
+            logger.error(f"Failed to fetch OSM data: {e}")
+            return []
 
     def _run_pipeline(self):
         if self.mode == "real":
@@ -82,14 +140,17 @@ class TrafficAnalyzer:
 
         caps = {}
         for cam in self.camera_config:
-            # Check file existence
-            src = cam["file"] if os.path.exists(cam["file"]) else 0 # 0 as fallback, or maybe skip?
-            if src == 0 and not os.path.exists("traffic.mov"): # Only fallback to webcam if NO file
-                 pass 
+            src = cam["file"]
             
-            # If specified file missing, try to use main traffic.mov
-            if isinstance(src, str) and not os.path.exists(src):
-                if os.path.exists("traffic.mov"): src = "traffic.mov"
+            # Check file existence and perform smart fallback
+            if not os.path.exists(src):
+                logger.warning(f"Video source '{src}' for {cam['id']} not found.")
+                if os.path.exists("traffic.mov"): 
+                     logger.warning("Falling back to default 'traffic.mov'.")
+                     src = "traffic.mov"
+                else:
+                     logger.error(f"No valid video source found for {cam['id']} (and no fallback). Skipping.")
+                     continue 
             
             cap = cv2.VideoCapture(src)
             if cap.isOpened():
@@ -115,7 +176,8 @@ class TrafficAnalyzer:
                     continue
                 
                 # Resize for speed (optional, but good for CPU)
-                frame = cv2.resize(frame, (640, 360))
+                # Increased to 1024x576 for better detection of small vehicles
+                frame = cv2.resize(frame, (1024, 576))
 
                 # Frame Skipping Logic
                 frame_count += 1
@@ -125,14 +187,15 @@ class TrafficAnalyzer:
                 annotated_frame = cached_annotated_frames.get(cam_id, frame)
 
                 if should_run_ai:
-                    # Run Tracking
-                    results = self.model.track(frame, persist=True, verbose=False)
+                    # Run Tracking with lowered confidence to catch more vehicles
+                    results = self.model.track(frame, persist=True, verbose=False, conf=0.15)
                     annotated_frame = results[0].plot()
                     # Cache this annotated frame
                     cached_annotated_frames[cam_id] = annotated_frame
 
                     # Count Logic
                     current_counts = {v: 0 for v in self.vehicle_types}
+                    current_ids = {v: [] for v in self.vehicle_types} # Store list of IDs per type
                     
                     if results[0].boxes.id is not None:
                         boxes = results[0].boxes
@@ -140,13 +203,14 @@ class TrafficAnalyzer:
                         clss = boxes.cls.int().cpu().tolist()
 
                         for track_id, cls_id in zip(track_ids, clss):
-                            # Add to unique set
+                            # Add to unique set (global)
                             self.unique_ids.add(track_id)
                             
                             label = self.model.names[cls_id].lower()
                             if label in ['car', 'motorcycle', 'bus', 'truck']:
                                 type_key = label if label != 'motorcycle' else 'bike'
                                 current_counts[type_key] += 1
+                                current_ids[type_key].append(track_id) # Store ID
                     
                     # Update Data Store
                     with self.lock:
@@ -161,6 +225,7 @@ class TrafficAnalyzer:
                                         "lng": next(c['lng'] for c in self.camera_config if c['id'] == cam_id),
                                         "vehicle_type": v_type,
                                         "count": count,
+                                        "track_ids": current_ids[v_type], # Save the IDs!
                                         "timestamp": timestamp
                                     })
                         # Prune Data
@@ -242,44 +307,112 @@ class TrafficAnalyzer:
             for cam in self.camera_config:
                 cam_data = [d for d in self.data if d['camera_id'] == cam['id']]
                 
-                # If no data yet (e.g. startup), return 0s but correct name
-                total_cam = sum(d['count'] for d in cam_data)
+                # Get current "live" count (Unique Track IDs in last 5 seconds)
+                # This is the most robust method. It counts how many UNIQUE vehicles (by ID)
+                # have been seen in the recent window.
                 
-                # Simple intensity calculation
-                intensity = "low"
-                if total_cam > 15: intensity = "moderate" # Lower threshold since we clean data often
-                if total_cam > 40: intensity = "high"
+                now = datetime.datetime.now()
+                recent_window = datetime.timedelta(seconds=5)
+                
+                # Filter data for this camera from the last 5 seconds
+                recent_data = [d for d in self.data if d['camera_id'] == cam['id'] and (now - datetime.datetime.fromisoformat(d['timestamp'])) < recent_window]
+                
+                current_load = 0
+                if recent_data:
+                    # Collect all unique track IDs seen in this window
+                    unique_ids_in_window = set()
+                    for d in recent_data:
+                        # Handle both old format (count only) and new format (track_ids list)
+                        # Ideally we updated _process_cameras to save track_ids.
+                        # For now, let's assume we update _process_cameras below or have done so.
+                        # Wait, I need to update _process_cameras first? 
+                        # I will assume I update storing logic in the same file edit or previous.
+                        # Actually, looking at previous edit, I didn't update storage yet.
+                        # So I must update _process_cameras to store 'track_ids'.
+                        ids = d.get('track_ids', [])
+                        unique_ids_in_window.update(ids)
+                    
+                    # If we have IDs, use them. If not (old data/simulated), fall back to max logic?
+                    # The goal is ID counting. I will update _process_cameras to ensure IDs are stored.
+                    current_load = len(unique_ids_in_window)
+                    
+                    # Fallback if no IDs found (e.g. simulated data or if tracking failed to assign IDs)
+                    if current_load == 0 and recent_data:
+                         # Fallback to Max logic just in case
+                        frame_counts = []
+                        timestamps = set(d['timestamp'] for d in recent_data)
+                        for ts in timestamps:
+                            count_in_frame = sum(d['count'] for d in recent_data if d['timestamp'] == ts)
+                            frame_counts.append(count_in_frame)
+                        current_load = max(frame_counts) if frame_counts else 0
                 
                 by_camera[cam['id']] = {
                     "lat": cam['lat'],
                     "lng": cam['lng'],
                     "name": cam['name'],
-                    "total": total_cam,
-                    "intensity": intensity,
-                    "breakdown": {v: sum(d['count'] for d in cam_data if d['vehicle_type'] == v) for v in self.vehicle_types}
+                    "total": current_load, # Use calculated MAX load
+                    "lanes": cam.get("lanes", 2), # Default to 2 if missing
+                    "breakdown": {v: sum(d['count'] for d in cam_data if d['vehicle_type'] == v) for v in self.vehicle_types} 
+                    # Note: Breakdown is still cumulative from buffer, which is fine for charts, but 'total' is live load
                 }
 
-            # Generate Dummy Heatmap Data (Using Persistent Locations)
+            # Generate Simulated Data (with Source Type)
             current_dummy_data = []
             for node in self.dummy_nodes:
-                # Random traffic intensity for this update
-                count = random.randint(10, 60)
-                intensity = "low"
-                if count > 20: intensity = "moderate"
-                if count > 45: intensity = "high"
+                # Random traffic intensity
+                count = random.randint(5, 50) 
                 
                 heading = node.copy()
                 heading.update({
                     "total": count,
-                    "intensity": intensity,
-                    "breakdown": {"car": count, "bike": 0, "bus": 0, "truck": 0}
+                     "lanes": 2, # Assume 2 lanes for dummy roads
+                    "breakdown": {"car": count, "bike": 0, "bus": 0, "truck": 0},
+                    "source_type": "simulated_cctv"
                 })
                 current_dummy_data.append(heading)
 
+            # Combine real and simulated data
+            # Ensure real camera data has source_type derived from config
+            real_locations = list(by_camera.values())
+            for loc in real_locations:
+                 loc['source_type'] = next((c['source_type'] for c in self.camera_config if c['name'] == loc['name']), 'live_cctv')
+
+            all_locations = real_locations + current_dummy_data
+            
+            if not all_locations:
+                return {"total_vehicles": total_vehicles, "distribution": by_type, "locations": []}
+
+            # --- Logic: Lane-Based Congestion ---
+            # Green (free flow): total_vehicles <= lanes * 2
+            # Yellow (moderate): lanes * 2 < total_vehicles <= lanes * 4
+            # Red (congested): total_vehicles > lanes * 4
+            
+            for loc in all_locations:
+                val = loc['total']
+                lanes = loc.get('lanes', 2)
+                
+                threshold_green = lanes * 2
+                threshold_yellow = lanes * 4
+                
+                if val <= threshold_green:
+                    loc['intensity'] = 'low'
+                    loc['weighted_intensity'] = 0.2
+                elif val <= threshold_yellow:
+                    loc['intensity'] = 'moderate'
+                    loc['weighted_intensity'] = 0.5
+                else:
+                    loc['intensity'] = 'congestion' # Using 'congestion' map to Red
+                    loc['weighted_intensity'] = 1.0
+
+            # Set dashboard total to the specific live camera count (CAM_002)
+            # This replaces the cumulative total with the "Current Vehicles in Frame"
+            live_cam_data = by_camera.get("CAM_002")
+            dashboard_total = live_cam_data['total'] if live_cam_data else 0
+
             return {
-                "total_vehicles": total_vehicles,
+                "total_vehicles": dashboard_total,
                 "distribution": by_type,
-                "locations": list(by_camera.values()) + current_dummy_data
+                "locations": all_locations
             }
 
 traffic_system = TrafficAnalyzer(mode="auto")
