@@ -1,4 +1,27 @@
 document.addEventListener('DOMContentLoaded', () => {
+    // Theme Toggle Logic
+    const themeToggleBtn = document.getElementById('theme-toggle');
+    const htmlElement = document.documentElement;
+
+    // Function to set theme
+    function setTheme(theme) {
+        htmlElement.setAttribute('data-theme', theme);
+        localStorage.setItem('theme', theme);
+    }
+
+    // Initialize theme
+    const savedTheme = localStorage.getItem('theme') || 'dark'; // Default to dark
+    setTheme(savedTheme);
+
+    // Toggle Event
+    if (themeToggleBtn) {
+        themeToggleBtn.addEventListener('click', () => {
+            const currentTheme = htmlElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+            setTheme(newTheme);
+        });
+    }
+
     // 1. Initialize Map
     // Focusing on Rajagiri Valley/Kochi area
     const map = L.map('map').setView([10.028, 76.308], 15);
