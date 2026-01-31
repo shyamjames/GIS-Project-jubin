@@ -12,3 +12,5 @@ flask
 ultralytics
 opencv-python
 numpy
+google-generativeai
+python-dotenv
